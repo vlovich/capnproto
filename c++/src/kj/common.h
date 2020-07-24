@@ -76,7 +76,7 @@ KJ_BEGIN_HEADER
     #endif
   #endif
 #elif defined(_MSC_VER)
-  #if _MSC_VER < 1910
+  #if _MSC_VER < 1910 && !defined(__clang__)
     #error "You need Visual Studio 2017 or better to compile this code."
   #endif
 #else
@@ -117,7 +117,14 @@ typedef unsigned char byte;
 // Detect whether RTTI and exceptions are enabled, assuming they are unless we have specific
 // evidence to the contrary.  Clients can always define KJ_NO_RTTI or KJ_NO_EXCEPTIONS explicitly
 // to override these checks.
-#ifdef __GNUC__
+#if defined(__clang__)
+  #if !defined(KJ_NO_RTTI) && !__has_feature(cxx_rtti)
+    #define KJ_NO_RTTI 1
+  #endif
+  #if !defined(KJ_NO_EXCEPTIONS) && !__has_feature(cxx_exceptions)
+    #define KJ_NO_EXCEPTIONS 1
+  #endif
+#elif defined(__GNUC__)
   #if !defined(KJ_NO_RTTI) && !__GXX_RTTI
     #define KJ_NO_RTTI 1
   #endif
@@ -167,7 +174,7 @@ typedef unsigned char byte;
 #define KJ_ALWAYS_INLINE(...) inline __VA_ARGS__
 // Don't force inline in debug mode.
 #else
-#if defined(_MSC_VER)
+#if defined(_MSC_VER) && !defined(__clang__)
 #define KJ_ALWAYS_INLINE(...) __forceinline __VA_ARGS__
 #else
 #define KJ_ALWAYS_INLINE(...) inline __VA_ARGS__ __attribute__((always_inline))
@@ -175,13 +182,13 @@ typedef unsigned char byte;
 // Force a function to always be inlined.  Apply only to the prototype, not to the definition.
 #endif
 
-#if defined(_MSC_VER)
+#if defined(_MSC_VER) && !defined(__clang__)
 #define KJ_NOINLINE __declspec(noinline)
 #else
 #define KJ_NOINLINE __attribute__((noinline))
 #endif
 
-#if defined(_MSC_VER) && !__clang__
+#if defined(_MSC_VER) && !defined(__clang__)
 #define KJ_NORETURN(prototype) __declspec(noreturn) prototype
 #define KJ_UNUSED
 #define KJ_WARN_UNUSED_RESULT
@@ -298,7 +305,7 @@ KJ_NORETURN(void unreachable());
 // Create a unique identifier name.  We use concatenate __LINE__ rather than __COUNTER__ so that
 // the name can be used multiple times in the same macro.
 
-#if _MSC_VER
+#if _MSC_VER && !__clang__
 
 #define KJ_CONSTEXPR(...) __VA_ARGS__
 // Use in cases where MSVC barfs on constexpr. A replacement keyword (e.g. "const") can be
@@ -412,7 +419,7 @@ struct DisallowConstCopy {
 #endif
 };
 
-#if _MSC_VER
+#if _MSC_VER && !__clang__
 
 #define KJ_CPCAP(obj) obj=::kj::cp(obj)
 // TODO(msvc): MSVC refuses to invoke non-const versions of copy constructors in by-value lambda
@@ -715,7 +722,7 @@ inline constexpr bool isNaN(float f) { return f != f; }
 inline constexpr bool isNaN(double f) { return f != f; }
 
 inline int popCount(unsigned int x) {
-#if defined(_MSC_VER)
+#if defined(_MSC_VER) && !defined(__clang__)
   return __popcnt(x);
   // Note: __popcnt returns unsigned int, but the value is clearly guaranteed to fit into an int
 #else
@@ -939,7 +946,7 @@ public:
     }
   }
   inline ~NullableValue()
-#if _MSC_VER
+#if _MSC_VER && !defined(__clang__)
       // TODO(msvc): MSVC has a hard time with noexcept specifier expressions that are more complex
       //   than `true` or `false`. We had a workaround for VS2015, but VS2017 regressed.
       noexcept(false)
@@ -1102,7 +1109,7 @@ public:
 private:
   bool isSet;
 
-#if _MSC_VER
+#if _MSC_VER && !defined(__clang__)
 #pragma warning(push)
 #pragma warning(disable: 4624)
 // Warns that the anonymous union has a deleted destructor when T is non-trivial. This warning
@@ -1113,7 +1120,7 @@ private:
     T value;
   };
 
-#if _MSC_VER
+#if _MSC_VER && !defined(__clang__)
 #pragma warning(pop)
 #endif
 
