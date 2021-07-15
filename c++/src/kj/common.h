@@ -257,10 +257,14 @@ typedef unsigned char byte;
 #define KJ_NO_UNIQUE_ADDRESS
 #endif
 
+#define __SANITIZE_THREAD__ 1
+
 #if KJ_HAS_COMPILER_FEATURE(thread_sanitizer) || defined(__SANITIZE_THREAD__)
+#define KJ_BUILD_WITH_TSAN 1
 #define KJ_DISABLE_TSAN __attribute__((no_sanitize("thread"), noinline))
 #else
 #define KJ_DISABLE_TSAN
+#define KJ_BUILD_WITH_TSAN 0
 #endif
 
 #if __clang__
@@ -1830,5 +1834,7 @@ _::Deferred<Func> defer(Func&& func) {
 // Run the given code when the function exits, whether by return or exception.
 
 }  // namespace kj
+
+#include "tsan_annotations.h"
 
 KJ_END_HEADER

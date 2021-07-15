@@ -26,6 +26,25 @@
 #include "mutex.h"
 #include "debug.h"
 
+#if KJ_BUILD_WITH_TSAN
+// Per https://groups.google.com/g/thread-sanitizer/c/T0G_NyyZ3s4, tsan_acquire after FUTEX_WAIT,
+// tsan_release before FUTEX_WAKE.
+
+namespace kj::tsan::mutex {
+namespace {
+[[gnu::always_inline]]
+static inline unsigned toFlags(_::Mutex::Exclusivity how, Maybe<Duration> failableLock) {
+  switch (how) {
+    case kj::_::Mutex::Exclusivity::EXCLUSIVE:
+      return failableLock != nullptr ? TRY_LOCK : 0;
+    case kj::_::Mutex::Exclusivity::SHARED:
+      return failableLock != nullptr ? TRY_READ_LOCK : READ_LOCK;
+  }
+}
+}
+}
+#endif
+
 #if !_WIN32 && !__CYGWIN__
 #include <time.h>
 #include <errno.h>
@@ -207,10 +226,14 @@ Mutex::AcquiredMetadata Mutex::lockedInfo() const {
 #define TRACK_ACQUIRED_TID() 0
 #endif
 
-Mutex::Mutex(): futex(0) {}
+Mutex::Mutex(): futex(0) {
+  tsan::mutex::create(&futex, tsan::mutex::NOT_STATIC);
+}
 Mutex::~Mutex() {
   // This will crash anyway, might as well crash with a nice error message.
   KJ_ASSERT(futex == 0, "Mutex destroyed while locked.") { break; }
+
+  tsan::mutex::destroy(&futex, tsan::mutex::NOT_STATIC);
 }
 
 bool Mutex::lock(Exclusivity exclusivity, Maybe<Duration> timeout, LockSourceLocationArg location) {
@@ -223,13 +246,15 @@ bool Mutex::lock(Exclusivity exclusivity, Maybe<Duration> timeout, LockSourceLoc
     specp = s;
   }
 
+  unsigned prelockFlags = tsan::mutex::toFlags(exclusivity, timeout);
+  tsan::mutex::preLock(&futex, prelockFlags);
+
   switch (exclusivity) {
     case EXCLUSIVE:
       for (;;) {
         uint state = 0;
         if (KJ_LIKELY(__atomic_compare_exchange_n(&futex, &state, EXCLUSIVE_HELD, false,
                                                   __ATOMIC_ACQUIRE, __ATOMIC_RELAXED))) {
-
           // Acquired.
           break;
         }
@@ -248,13 +273,18 @@ bool Mutex::lock(Exclusivity exclusivity, Maybe<Duration> timeout, LockSourceLoc
         setCurrentThreadIsWaitingFor(&blockReason);
 
         auto result = syscall(SYS_futex, &futex, FUTEX_WAIT_PRIVATE, state, specp, nullptr, 0);
+
         if (result < 0) {
           if (errno == ETIMEDOUT) {
+            tsan::mutex::postLock(&futex, prelockFlags | tsan::mutex::TRY_LOCK_FAILED, 0);
+
             setCurrentThreadIsNoLongerWaiting();
             // We timed out, we can't remove the exclusive request flag (since others might be waiting)
             // so we just return false.
             return false;
           }
+        } else if (result == 0) {
+          tsan::acquire(&futex);
         }
       }
       acquiredExclusive(TRACK_ACQUIRED_TID(), location);
@@ -273,9 +303,12 @@ bool Mutex::lock(Exclusivity exclusivity, Maybe<Duration> timeout, LockSourceLoc
         // The mutex is exclusively locked by another thread.  Since we incremented the counter
         // already, we just have to wait for it to be unlocked.
         auto result = syscall(SYS_futex, &futex, FUTEX_WAIT_PRIVATE, state, specp, nullptr, 0);
+
         if (result < 0) {
           // If we timeout though, we need to signal that we're not waiting anymore.
           if (errno == ETIMEDOUT) {
+            tsan::mutex::postLock(&futex, prelockFlags | tsan::mutex::TRY_LOCK_FAILED, 0);
+
             setCurrentThreadIsNoLongerWaiting();
             state = __atomic_sub_fetch(&futex, 1, __ATOMIC_RELAXED);
 
@@ -284,9 +317,11 @@ bool Mutex::lock(Exclusivity exclusivity, Maybe<Duration> timeout, LockSourceLoc
             if (KJ_UNLIKELY(state == EXCLUSIVE_REQUESTED)) {
               if (__atomic_compare_exchange_n(
                   &futex, &state, 0, false, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {
+                tsan::mutex::preSignal(&futex, 0);
                 // Wake all exclusive waiters.  We have to wake all of them because one of them will
                 // grab the lock while the others will re-establish the exclusive-requested bit.
                 syscall(SYS_futex, &futex, FUTEX_WAKE_PRIVATE, INT_MAX, nullptr, nullptr, 0);
+                tsan::mutex::postSignal(&futex, 0);
               }
             }
             return false;
@@ -310,12 +345,17 @@ bool Mutex::lock(Exclusivity exclusivity, Maybe<Duration> timeout, LockSourceLoc
       break;
     }
   }
+
+  tsan::mutex::postLock(&futex, prelockFlags, 0);
+
   return true;
 }
 
 void Mutex::unlock(Exclusivity exclusivity, Waiter* waiterToSkip) {
   switch (exclusivity) {
     case EXCLUSIVE: {
+      tsan::mutex::preUnlock(&futex, 0);
+
       KJ_DASSERT(futex & EXCLUSIVE_HELD, "Unlocked a mutex that wasn't locked.");
 
 #ifdef KJ_CONTENTION_WARNING_THRESHOLD
@@ -353,7 +393,10 @@ void Mutex::unlock(Exclusivity exclusivity, Waiter* waiterToSkip) {
             } else {
               __atomic_store_n(&waiter->futex, 1, __ATOMIC_RELEASE);
             }
+
+            tsan::mutex::preSignal(&waiter->futex, 0);
             syscall(SYS_futex, &waiter->futex, FUTEX_WAKE_PRIVATE, INT_MAX, nullptr, nullptr, 0);
+            tsan::mutex::postSignal(&waiter->futex, 0);
 
             // We transferred ownership of the lock to this waiter, so we're done now.
             return;
@@ -368,7 +411,11 @@ void Mutex::unlock(Exclusivity exclusivity, Waiter* waiterToSkip) {
       uint oldState = __atomic_fetch_and(
           &futex, ~(EXCLUSIVE_HELD | EXCLUSIVE_REQUESTED), __ATOMIC_RELEASE);
 
+      tsan::mutex::postUnlock(&futex, 0);
+
       if (KJ_UNLIKELY(oldState & ~EXCLUSIVE_HELD)) {
+        tsan::mutex::preSignal(&futex, 0);
+
         // Other threads are waiting.  If there are any shared waiters, they now collectively hold
         // the lock, and we must wake them up.  If there are any exclusive waiters, we must wake
         // them up even if readers are waiting so that at the very least they may re-establish the
@@ -376,19 +423,27 @@ void Mutex::unlock(Exclusivity exclusivity, Waiter* waiterToSkip) {
         syscall(SYS_futex, &futex, FUTEX_WAKE_PRIVATE, INT_MAX, nullptr, nullptr, 0);
 
 #ifdef KJ_CONTENTION_WARNING_THRESHOLD
+        // TODO(later): Does this need a __tsan_mutex_pre/post_divert? What address would I even
+        // supply & when/why is it important to convey this information to TSAN?
         uint readerCount = oldState & SHARED_COUNT_MASK;
         if (readerCount >= KJ_CONTENTION_WARNING_THRESHOLD) {
           KJ_LOG(WARNING, "excessively many readers were waiting on this lock", readerCount,
               kj::getStackTrace(), acquiredLocation);
         }
 #endif
+
+        tsan::mutex::postSignal(&futex, 0);
       }
       break;
     }
 
     case SHARED: {
+      tsan::mutex::preUnlock(&futex, tsan::mutex::READ_LOCK);
+
       KJ_DASSERT(futex & SHARED_COUNT_MASK, "Unshared a mutex that wasn't shared.");
       uint state = __atomic_sub_fetch(&futex, 1, __ATOMIC_RELEASE);
+
+      tsan::mutex::postUnlock(&futex, tsan::mutex::READ_LOCK);
 
       // The only case where anyone is waiting is if EXCLUSIVE_REQUESTED is set, and the only time
       // it makes sense to wake up that waiter is if the shared count has reached zero.
@@ -397,7 +452,12 @@ void Mutex::unlock(Exclusivity exclusivity, Waiter* waiterToSkip) {
             &futex, &state, 0, false, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {
           // Wake all exclusive waiters.  We have to wake all of them because one of them will
           // grab the lock while the others will re-establish the exclusive-requested bit.
+
+          tsan::mutex::preSignal(&futex, 0);
+
           syscall(SYS_futex, &futex, FUTEX_WAKE_PRIVATE, INT_MAX, nullptr, nullptr, 0);
+
+          tsan::mutex::postSignal(&futex, 0);
         }
       }
       break;
@@ -419,6 +479,8 @@ void Mutex::assertLockedByCaller(Exclusivity exclusivity) {
 }
 
 void Mutex::wait(Predicate& predicate, Maybe<Duration> timeout, LockSourceLocationArg location) {
+  assertLockedByCaller(Exclusivity::EXCLUSIVE);
+
   // Add waiter to list.
   Waiter waiter { nullptr, waitersTail, predicate, nullptr, 0, timeout != nullptr };
   addWaiter(waiter);
@@ -461,12 +523,15 @@ void Mutex::wait(Predicate& predicate, Maybe<Duration> timeout, LockSourceLocati
         case EAGAIN:
           // Indicates that the futex was already non-zero by the time the kernal looked at it.
           // Not an error.
+          tsan::acquire(&waiter.futex);
           break;
         case ETIMEDOUT: {
           // Wait timed out. This leaves us in a bit of a pickle: Ownership of the mutex was not
           // transferred to us from another thread. So, we need to lock it ourselves. But, another
           // thread might be in the process of signaling us and transferring ownership. So, we
           // first must atomically take control of our destiny.
+          tsan::acquire(&waiter.futex);
+
           KJ_ASSERT(timeout != nullptr);
           uint expected = 0;
           if (__atomic_compare_exchange_n(&waiter.futex, &expected, 1, false,
@@ -485,6 +550,8 @@ void Mutex::wait(Predicate& predicate, Maybe<Duration> timeout, LockSourceLocati
         }
         default:
           KJ_FAIL_SYSCALL("futex(FUTEX_WAIT_PRIVATE)", error);
+      } else {
+        tsan::acquire(&waiter.futex);
       }
 
       setCurrentThreadIsNoLongerWaiting();
